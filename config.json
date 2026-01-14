@@ -1,0 +1,18 @@
+[
+  {
+    "id": "tram_vanyen",
+    "enable": true,
+    "src_host": "rtktk.online",
+    "src_port": 1509,
+    "src_mount": "YBI_VanYen",
+    "src_user": "nguyen",
+    "src_pass": "12345678",
+    "dst_host": "servers.onocoy.com",
+    "dst_port": 2101,
+    "dst_mount": "YBVY_Relay",
+    "dst_user": "PlainlyFairFirefly",
+    "dst_pass": "Nguyen1509232",
+    "lat": 21.0,
+    "lon": 105.0
+  }
+]
