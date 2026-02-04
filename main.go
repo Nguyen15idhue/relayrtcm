@@ -20,18 +20,32 @@ import (
 	"time"
 )
 
-// ================= CONSTANTS =================
+// ================= CẤU HÌNH HỆ THỐNG =================
 const (
-	ConfigFile       = "config.json"
-	MonitorPort      = ":8081"
-	ReconnectDelay   = 5 * time.Second  // Thời gian chờ khi lỗi thường
-	BlockWaitDelay   = 30 * time.Second // Thời gian chờ khi bị Server chặn (EOF)
-	SendNMEAInterval = 10 * time.Second
-	ReadTimeout      = 15 * time.Second
-	DialTimeout      = 10 * time.Second
+	ConfigFile  = "config.json"
+	MonitorPort = ":8081"
+
+	// Timeout & Interval
+	NormalRetryDelay = 5 * time.Second  // Chờ khi đứt mạng bình thường
+	BlockRetryDelay  = 30 * time.Second // Chờ khi bị Server đá (EOF/Auth fail)
+	ReadTimeout      = 60 * time.Second // Nếu nguồn im lặng 60s -> Reset
+	DialTimeout      = 15 * time.Second // Timeout khi kết nối TCP
+	SendNMEAInterval = 10 * time.Second // Gửi NMEA mỗi 10s
+
+	// Buffer Size: 32KB là tối ưu cho luồng TCP
+	BufferSize = 32 * 1024
 )
 
-// ================= STRUCTS =================
+// ================= MEMORY POOL (Tối ưu RAM) =================
+var bufPool = sync.Pool{
+	New: func() interface{} {
+		// Cấp phát mảng byte một lần, tái sử dụng mãi mãi
+		b := make([]byte, BufferSize)
+		return &b
+	},
+}
+
+// ================= DATA STRUCTURES =================
 type ConfigStation struct {
 	ID       string  `json:"id"`
 	Enable   bool    `json:"enable"`
@@ -60,54 +74,81 @@ type StationStatus struct {
 }
 
 type Worker struct {
-	cfg        ConfigStation
-	ctx        context.Context
-	cancel     context.CancelFunc
-	status     *StationStatus
-	configHash string
-	order      int
+	cfg          ConfigStation
+	ctx          context.Context
+	cancel       context.CancelFunc
+	status       *StationStatus
+	configHash   string
+	wg           sync.WaitGroup // Đợi các goroutine con dọn dẹp xong
+	lastDataTime int64          // Unix timestamp lần nhận data cuối (atomic)
 }
 
 type StationManager struct {
-	mu      sync.RWMutex
-	workers map[string]*Worker
+	mu          sync.RWMutex
+	workers     map[string]*Worker
+	lastModTime time.Time
 }
 
 var manager = &StationManager{
 	workers: make(map[string]*Worker),
 }
 
-// ================= MAIN =================
+// ================= MAIN ENTRY =================
 func main() {
-	log.Println("=== NTRIP RELAY SYSTEM STARTED (FIXED) ===")
+	// Cấu hình log hiển thị thời gian và dòng code lỗi
+	log.SetFlags(log.LstdFlags | log.Lshortfile)
+	log.Println("=== NTRIP RELAY SYSTEM (ULTIMATE STABILITY) ===")
 
+	// Khởi động Web Monitor
 	go startMonitorServer()
+
+	// Load config lần đầu
 	reloadConfig()
 
-	ticker := time.NewTicker(10 * time.Second)
+	// Theo dõi file config mỗi 5 giây
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
 	for range ticker.C {
 		reloadConfig()
 	}
 }
 
-// ================= MANAGER LOGIC =================
+// ================= CONFIG MANAGER =================
 func reloadConfig() {
+	// 1. Kiểm tra nhanh xem file có đổi không (tiết kiệm CPU)
+	stat, err := os.Stat(ConfigFile)
+	if err != nil {
+		log.Printf("[System] Cannot check config file: %v", err)
+		return
+	}
+
+	manager.mu.Lock()
+	if !stat.ModTime().After(manager.lastModTime) {
+		manager.mu.Unlock()
+		return // File chưa sửa, thoát ngay
+	}
+	manager.lastModTime = stat.ModTime()
+	manager.mu.Unlock() // Mở khóa để đọc file
+
+	// 2. Đọc và Parse
 	file, err := os.ReadFile(ConfigFile)
 	if err != nil {
-		log.Printf("[System] Cannot read config: %v", err)
+		log.Printf("[System] Read config failed: %v", err)
 		return
 	}
 
 	var configs []ConfigStation
 	if err := json.Unmarshal(file, &configs); err != nil {
-		log.Printf("[System] JSON error: %v", err)
+		log.Printf("[System] JSON parse failed: %v", err)
 		return
 	}
 
+	// 3. Cập nhật Workers
 	manager.mu.Lock()
 	defer manager.mu.Unlock()
 
 	activeIDs := make(map[string]bool)
+	log.Println("[System] Configuration changed. Applying...")
 
 	for i, cfg := range configs {
 		activeIDs[cfg.ID] = true
@@ -115,138 +156,166 @@ func reloadConfig() {
 
 		worker, exists := manager.workers[cfg.ID]
 		if exists {
-			// Cập nhật order ngay cả khi worker đã tồn tại
-			worker.order = i
+			// Cập nhật thứ tự hiển thị
 			worker.status.Order = i
 
+			// Nếu config quan trọng thay đổi -> Restart worker
 			if worker.configHash != hash || !cfg.Enable {
-				log.Printf("[%s] Config changed. Restarting...", cfg.ID)
-				worker.cancel()
+				log.Printf("[%s] Config changed. Restarting worker...", cfg.ID)
+				worker.cancel()  // Gửi lệnh dừng
+				worker.wg.Wait() // Chờ dừng hẳn
 				delete(manager.workers, cfg.ID)
 				exists = false
 			}
 		}
 
 		if !exists && cfg.Enable {
+			// Khởi tạo Worker mới
 			ctx, cancel := context.WithCancel(context.Background())
 			status := &StationStatus{ID: cfg.ID, Status: "Starting", Order: i}
-			w := &Worker{cfg: cfg, ctx: ctx, cancel: cancel, status: status, configHash: hash, order: i}
+			w := &Worker{
+				cfg:        cfg,
+				ctx:        ctx,
+				cancel:     cancel,
+				status:     status,
+				configHash: hash,
+			}
 			manager.workers[cfg.ID] = w
-			go w.Start()
-			log.Printf("[%s] Started.", cfg.ID)
+			go w.Start() // Chạy vòng lặp chính
+			log.Printf("[%s] Worker initialized.", cfg.ID)
 		}
 	}
 
+	// Xóa các worker bị xóa khỏi config
 	for id, worker := range manager.workers {
 		if !activeIDs[id] {
-			log.Printf("[%s] Removed. Stopping...", id)
+			log.Printf("[%s] Removed from config. Stopping...", id)
 			worker.cancel()
+			worker.wg.Wait()
 			delete(manager.workers, id)
 		}
 	}
 }
 
-// ================= WORKER LOGIC =================
+// ================= WORKER CORE LOGIC =================
 func (w *Worker) Start() {
+	w.wg.Add(1)
+	defer w.wg.Done()
+
 	w.status.StartTime = time.Now()
+
+	// Vòng lặp vĩnh cửu (cho đến khi config tắt)
 	for {
+		// Kiểm tra xem có lệnh dừng không
 		select {
 		case <-w.ctx.Done():
 			w.status.Status = "Stopped"
 			return
 		default:
-			err := w.runSession()
-			if err != nil {
-				w.status.Status = "Error"
-				w.status.LastMessage = err.Error()
+		}
 
-				// Logic xử lý lỗi thông minh hơn
-				delay := ReconnectDelay
-				if strings.Contains(err.Error(), "EOF") || strings.Contains(err.Error(), "reset by peer") {
-					// Nếu bị server dập kết nối, chờ lâu hơn để tránh bị ban IP vĩnh viễn
-					delay = BlockWaitDelay
-					w.status.LastMessage += " (Waiting 30s...)"
-				}
+		sessionStart := time.Now()
 
-				log.Printf("[%s] Error: %v. Retry in %v...", w.cfg.ID, err, delay)
+		// --- BẮT ĐẦU PHIÊN LÀM VIỆC ---
+		err := w.runSession()
+		// -----------------------------
 
-				select {
-				case <-time.After(delay):
-				case <-w.ctx.Done():
-					return
-				}
+		if err != nil {
+			// Logic xử lý lỗi thông minh
+			w.status.Status = "Error"
+			w.status.LastMessage = err.Error()
+
+			// Tính thời gian phiên vừa chạy
+			runDuration := time.Since(sessionStart)
+
+			delay := NormalRetryDelay
+
+			// Nếu lỗi Auth, EOF, hoặc phiên chạy quá ngắn (<10s) -> Nghi ngờ bị chặn
+			if strings.Contains(err.Error(), "EOF") ||
+				strings.Contains(err.Error(), "forcibly closed") ||
+				strings.Contains(err.Error(), "rejected") ||
+				runDuration < 10*time.Second {
+
+				delay = BlockRetryDelay
+				w.status.LastMessage += " (Anti-Ban Wait 30s)"
+			}
+
+			log.Printf("[%s] Error: %v. Retry in %v", w.cfg.ID, err, delay)
+
+			// Chờ trước khi thử lại (có thể bị cancel giữa chừng)
+			timer := time.NewTimer(delay)
+			select {
+			case <-timer.C:
+				// Hết giờ, thử lại
+			case <-w.ctx.Done():
+				timer.Stop()
+				return
 			}
 		}
 	}
 }
 
+// Hàm xử lý kết nối chính
 func (w *Worker) runSession() error {
-	w.status.Status = "Connecting Source"
+	// Dùng Dialer để có thể cancel kết nối đang pending
+	dialer := net.Dialer{Timeout: DialTimeout}
 
-	// 1. SOURCE CONNECTION
-	srcConn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", w.cfg.SrcHost, w.cfg.SrcPort), DialTimeout)
+	// 1. KẾT NỐI SOURCE (NGUỒN)
+	w.status.Status = "Connecting Source"
+	srcConn, err := dialer.DialContext(w.ctx, "tcp", fmt.Sprintf("%s:%d", w.cfg.SrcHost, w.cfg.SrcPort))
 	if err != nil {
-		return fmt.Errorf("connect source: %w", err)
+		return fmt.Errorf("dial source: %w", err)
 	}
 	defer srcConn.Close()
 
-	// Header GET
+	// Gửi Header GET
 	authSrc := basicAuth(w.cfg.SrcUser, w.cfg.SrcPass)
-	reqSrc := fmt.Sprintf(
-		"GET /%s HTTP/1.1\r\n"+
-			"Host: %s\r\n"+
-			"Ntrip-Version: Ntrip/2.0\r\n"+
-			"User-Agent: NTRIP GoRelay/2.0\r\n"+
-			"Authorization: Basic %s\r\n"+
-			"Connection: close\r\n\r\n",
+	reqSrc := fmt.Sprintf("GET /%s HTTP/1.1\r\nHost: %s\r\nNtrip-Version: Ntrip/2.0\r\nUser-Agent: NTRIP GoRelay/2.0\r\nAuthorization: Basic %s\r\nConnection: close\r\n\r\n",
 		w.cfg.SrcMount, w.cfg.SrcHost, authSrc)
-
 	if _, err := srcConn.Write([]byte(reqSrc)); err != nil {
-		return err
+		return fmt.Errorf("send request source: %w", err)
 	}
 
-	if err := checkResponse(srcConn); err != nil {
+	// [QUAN TRỌNG] Bufio bọc lấy srcConn. Cần giữ cái Reader này dùng mãi mãi.
+	srcReader := bufio.NewReaderSize(srcConn, BufferSize)
+	if err := checkResponse(srcReader, srcConn); err != nil {
 		return fmt.Errorf("source auth: %w", err)
 	}
 
-	srcConn.Write([]byte(generateNMEA(w.cfg.Lat, w.cfg.Lon)))
+	// Gửi NMEA mở hàng (ban đầu là Single vì chưa có data)
+	srcConn.Write([]byte(generateNMEA(w.cfg.Lat, w.cfg.Lon, false)))
 
-	// 2. DEST CONNECTION
+	// 2. KẾT NỐI DESTINATION (ĐÍCH)
 	w.status.Status = "Connecting Dest"
-	dstConn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", w.cfg.DstHost, w.cfg.DstPort), DialTimeout)
+	dstConn, err := dialer.DialContext(w.ctx, "tcp", fmt.Sprintf("%s:%d", w.cfg.DstHost, w.cfg.DstPort))
 	if err != nil {
-		return fmt.Errorf("connect dest: %w", err)
+		return fmt.Errorf("dial dest: %w", err)
 	}
 	defer dstConn.Close()
 
-	// Header POST
+	// Gửi Header POST
 	authDst := basicAuth(w.cfg.DstUser, w.cfg.DstPass)
-	reqDstCompatible := fmt.Sprintf(
-		"POST /%s HTTP/1.1\r\n"+
-			"Host: %s\r\n"+
-			"Ntrip-Version: Ntrip/2.0\r\n"+
-			"User-Agent: NTRIP GoRelay/2.0\r\n"+
-			"Authorization: Basic %s\r\n"+
-			"Content-Type: application/octet-stream\r\n"+
-			"Connection: close\r\n\r\n",
+	reqDst := fmt.Sprintf("POST /%s HTTP/1.1\r\nHost: %s\r\nNtrip-Version: Ntrip/2.0\r\nUser-Agent: NTRIP GoRelay/2.0\r\nAuthorization: Basic %s\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n",
 		w.cfg.DstMount, w.cfg.DstHost, authDst)
-
-	if _, err := dstConn.Write([]byte(reqDstCompatible)); err != nil {
-		return err
+	if _, err := dstConn.Write([]byte(reqDst)); err != nil {
+		return fmt.Errorf("send request dest: %w", err)
 	}
 
-	if err := checkResponse(dstConn); err != nil {
+	// Check Dest trả lời
+	dstReader := bufio.NewReader(dstConn)
+	if err := checkResponse(dstReader, dstConn); err != nil {
 		return fmt.Errorf("dest auth: %w", err)
 	}
 
+	// 3. CHUYỂN TRẠNG THÁI STREAMING
 	w.status.Status = "Running"
 	w.status.LastMessage = "Streaming OK"
-	log.Printf("[%s] RELAYING: %s -> %s", w.cfg.ID, w.cfg.SrcMount, w.cfg.DstMount)
+	log.Printf("[%s] CONNECTED: %s -> %s", w.cfg.ID, w.cfg.SrcMount, w.cfg.DstMount)
 
-	// 3. STREAMING LOOP
-	errChan := make(chan error, 2)
+	// Channel báo lỗi từ các luồng phụ
+	errChan := make(chan error, 1)
 
-	// NMEA Heartbeat
+	// -- Luồng phụ 1: Gửi NMEA Heartbeat --
 	go func() {
 		ticker := time.NewTicker(SendNMEAInterval)
 		defer ticker.Stop()
@@ -255,75 +324,110 @@ func (w *Worker) runSession() error {
 			case <-w.ctx.Done():
 				return
 			case <-ticker.C:
-				if _, err := srcConn.Write([]byte(generateNMEA(w.cfg.Lat, w.cfg.Lon))); err != nil {
+				// Kiểm tra xem có data gần đây không (trong 30s)
+				lastData := atomic.LoadInt64(&w.lastDataTime)
+				hasRecentData := (time.Now().Unix() - lastData) <= 30
+				
+				// Tạo NMEA với fix quality phù hợp
+				msg := generateNMEA(w.cfg.Lat, w.cfg.Lon, hasRecentData)
+				srcConn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+				if _, err := srcConn.Write([]byte(msg)); err != nil {
+					// Lỗi gửi NMEA -> Coi như mất kết nối Source
+					select {
+					case errChan <- fmt.Errorf("nmea write error: %v", err):
+					default:
+					}
 					return
+				}
+				srcConn.SetWriteDeadline(time.Time{})
+				
+				// Cập nhật timestamp khi gửi NMEA thành công
+				if hasRecentData {
+					atomic.StoreInt64(&w.lastDataTime, time.Now().Unix())
 				}
 			}
 		}
 	}()
 
-	// --- ĐOẠN SỬA QUAN TRỌNG Ở ĐÂY ---
-	// Read Dest: Bỏ timeout, chỉ đợi khi nào connection thực sự bị đóng (EOF/Error)
+	// -- Luồng phụ 2: Đọc phản hồi từ Dest (để phát hiện nếu Dest ngắt) --
 	go func() {
-		buf := make([]byte, 1024)
+		// Dùng buffer nhỏ từ pool để đọc bỏ
+		bufPtr := bufPool.Get().(*[]byte)
+		defer bufPool.Put(bufPtr)
+		buf := *bufPtr
+
 		for {
-			// SỬA: Xóa dòng dstConn.SetReadDeadline(...)
+			// Đọc không timeout, chỉ đợi lỗi
 			_, err := dstConn.Read(buf)
 			if err != nil {
-				// Chỉ báo lỗi nếu kết nối thực sự đứt hoặc bị đóng
-				errChan <- fmt.Errorf("dest connection closed: %v", err)
+				select {
+				case errChan <- fmt.Errorf("dest connection closed: %v", err):
+				default:
+				}
 				return
 			}
-			// Nếu server có gửi gì về (hiếm), ta cứ lờ đi và đọc tiếp
 		}
 	}()
-	// ----------------------------------
 
-	// Main Loop: Src -> Dest
-	buf := make([]byte, 8192)
+	// -- Luồng chính: Đọc Source -> Ghi Dest --
+	bufPtr := bufPool.Get().(*[]byte)
+	defer bufPool.Put(bufPtr)
+	buf := *bufPtr
+
 	for {
-		// Vẫn giữ Timeout cho Source (nếu Source im lặng 15s nghĩa là mất data -> reset)
+		// Set Timeout đọc: Nếu 60s mà Source không gửi byte nào -> Kill
 		srcConn.SetReadDeadline(time.Now().Add(ReadTimeout))
-		n, err := srcConn.Read(buf)
+
+		// ĐỌC TỪ BUFFER READER (Không phải conn)
+		n, err := srcReader.Read(buf)
 		if err != nil {
 			return fmt.Errorf("read source: %v", err)
 		}
 
 		if n > 0 {
-			// Ghi sang Dest (đặt timeout ghi để tránh treo nếu mạng lag)
+			// Ghi sang Dest (có timeout ghi)
 			dstConn.SetWriteDeadline(time.Now().Add(DialTimeout))
 			_, err := dstConn.Write(buf[:n])
 			if err != nil {
 				return fmt.Errorf("write dest: %v", err)
 			}
-			// Reset lại timeout ghi sau khi ghi xong
-			dstConn.SetWriteDeadline(time.Time{})
+			dstConn.SetWriteDeadline(time.Time{}) // Xóa timeout
 
+			// Cập nhật thống kê (Atomic để an toàn thread)
 			atomic.AddInt64(&w.status.BytesForwarded, int64(n))
+			
+			// Cập nhật timestamp nhận data (để GGA biết fix quality)
+			atomic.StoreInt64(&w.lastDataTime, time.Now().Unix())
 		}
 
+		// Kiểm tra lỗi từ các luồng phụ
 		select {
 		case err := <-errChan:
 			return err
+		case <-w.ctx.Done():
+			return context.Canceled
 		default:
+			// Không có lỗi, tiếp tục vòng lặp
 		}
 	}
 }
 
 // ================= HELPERS =================
-func checkResponse(conn net.Conn) error {
-	reader := bufio.NewReader(conn)
+
+func checkResponse(reader *bufio.Reader, conn net.Conn) error {
+	// Timeout cho việc đọc header response
 	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	defer conn.SetReadDeadline(time.Time{})
 
 	line, err := reader.ReadString('\n')
 	if err != nil {
 		if err == io.EOF {
-			return fmt.Errorf("server closed connection immediately (EOF)")
+			return fmt.Errorf("server closed immediately (EOF) - Check credentials/mountpoint")
 		}
 		return err
 	}
 
-	// Đọc hết header còn lại
+	// Đọc xả hết các dòng header còn lại (đến khi gặp dòng trắng)
 	for {
 		l, err := reader.ReadString('\n')
 		if err != nil {
@@ -334,24 +438,34 @@ func checkResponse(conn net.Conn) error {
 		}
 	}
 
-	if !strings.Contains(line, "200 OK") && !strings.Contains(line, "ICY 200") {
-		return fmt.Errorf("server rejected: %s", strings.TrimSpace(line))
+	// Kiểm tra mã phản hồi
+	if strings.Contains(line, "200 OK") || strings.Contains(line, "ICY 200") {
+		return nil
 	}
 
-	conn.SetReadDeadline(time.Time{})
-	return nil
+	// Server báo lỗi (401, 404, 403...)
+	return fmt.Errorf("rejected: %s", strings.TrimSpace(line))
 }
 
 func basicAuth(user, pass string) string {
 	return base64.StdEncoding.EncodeToString([]byte(user + ":" + pass))
 }
 
-func generateNMEA(lat, lon float64) string {
+func generateNMEA(lat, lon float64, hasData bool) string {
 	now := time.Now().UTC()
-	timestamp := fmt.Sprintf("%02d%02d%02d.00", now.Hour(), now.Minute(), now.Second())
 	latStr := toDegMinDir(lat, true)
 	lonStr := toDegMinDir(lon, false)
-	raw := fmt.Sprintf("GPGGA,%s,%s,%s,1,10,1.0,100.0,M,-5.0,M,,", timestamp, latStr, lonStr)
+
+	// Xác định fix quality: 4=RTK Fixed, 1=GPS Single
+	fixQuality := 1
+	if hasData {
+		fixQuality = 4
+	}
+
+	// GPGGA format: $GPGGA,hhmmss.ss,lat,dir,lon,dir,fix,sats,hdop,alt,M,sep,M,,*cs
+	raw := fmt.Sprintf("GPGGA,%02d%02d%02d.00,%s,%s,%d,10,1.0,100.0,M,-5.0,M,,",
+		now.Hour(), now.Minute(), now.Second(), latStr, lonStr, fixQuality)
+
 	var checksum byte
 	for i := 0; i < len(raw); i++ {
 		checksum ^= raw[i]
@@ -362,23 +476,20 @@ func generateNMEA(lat, lon float64) string {
 func toDegMinDir(val float64, isLat bool) string {
 	absVal := math.Abs(val)
 	deg := int(absVal)
-	min := (absVal - float64(deg)) * 60
-	dir := ""
+	min := (absVal - float64(deg)) * 60.0
+
 	if isLat {
-		if val >= 0 {
-			dir = "N"
-		} else {
+		dir := "N"
+		if val < 0 {
 			dir = "S"
 		}
 		return fmt.Sprintf("%02d%07.4f,%s", deg, min, dir)
-	} else {
-		if val >= 0 {
-			dir = "E"
-		} else {
-			dir = "W"
-		}
-		return fmt.Sprintf("%03d%07.4f,%s", deg, min, dir)
 	}
+	dir := "E"
+	if val < 0 {
+		dir = "W"
+	}
+	return fmt.Sprintf("%03d%07.4f,%s", deg, min, dir)
 }
 
 func getMD5Hash(c ConfigStation) string {
@@ -387,86 +498,27 @@ func getMD5Hash(c ConfigStation) string {
 	return hex.EncodeToString(hash[:])
 }
 
+// ================= WEB MONITOR =================
 func startMonitorServer() {
-	// HTML Dashboard
+	// Giao diện Web
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		html := `<!DOCTYPE html>
-<html>
-<head>
-	<title>NTRIP Relay Monitor</title>
-	<meta charset="utf-8">
-	<style>
-		body { font-family: Arial, sans-serif; margin: 20px; background: #f5f5f5; }
-		h1 { color: #333; }
-		.station { background: white; padding: 15px; margin: 10px 0; border-radius: 5px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
-		.status { display: inline-block; padding: 5px 10px; border-radius: 3px; color: white; font-weight: bold; }
-		.Running { background: #4CAF50; }
-		.Error { background: #f44336; }
-		.Connecting { background: #FF9800; }
-		.Stopped { background: #9E9E9E; }
-		.stat { margin: 5px 0; }
-		.label { font-weight: bold; color: #666; }
-		.value { color: #333; }
-		.updated { text-align: right; color: #999; font-size: 12px; margin-top: 10px; }
-	</style>
-</head>
-<body>
-	<h1>🛰️ NTRIP Relay Monitor</h1>
-	<div id="stations"></div>
-	<div class="updated">Last updated: <span id="lastUpdate">-</span></div>
-	<script>
-		function updateStatus() {
-			fetch('/status')
-				.then(res => res.json())
-				.then(data => {
-					const container = document.getElementById('stations');
-					if (!data || data.length === 0) {
-						container.innerHTML = '<p>No stations configured</p>';
-						return;
-					}
-					container.innerHTML = data.map(s => ` + "`" + `
-						<div class="station">
-							<h3>${s.id}</h3>
-							<div class="stat"><span class="status ${s.status}">${s.status}</span></div>
-							<div class="stat"><span class="label">Uptime:</span> <span class="value">${s.uptime}</span></div>
-							<div class="stat"><span class="label">Data:</span> <span class="value">${formatBytes(s.bytes_forwarded)}</span></div>
-							<div class="stat"><span class="label">Message:</span> <span class="value">${s.last_message}</span></div>
-						</div>
-					` + "`" + `).join('');
-					document.getElementById('lastUpdate').textContent = new Date().toLocaleTimeString();
-				})
-				.catch(err => {
-					document.getElementById('stations').innerHTML = '<p style="color:red">Error loading data</p>';
-				});
-		}
-		function formatBytes(bytes) {
-			if (bytes === 0) return '0 B';
-			const k = 1024;
-			const sizes = ['B', 'KB', 'MB', 'GB'];
-			const i = Math.floor(Math.log(bytes) / Math.log(k));
-			return Math.round(bytes / Math.pow(k, i) * 100) / 100 + ' ' + sizes[i];
-		}
-		updateStatus();
-		setInterval(updateStatus, 2000); // Auto refresh every 2 seconds
-	</script>
-</body>
-</html>`
-		fmt.Fprint(w, html)
+		fmt.Fprint(w, htmlContent)
 	})
 
-	// JSON API endpoint
+	// API JSON
 	http.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
 		manager.mu.RLock()
 		defer manager.mu.RUnlock()
-		var stats []StationStatus
+
+		stats := make([]StationStatus, 0, len(manager.workers))
 		for _, worker := range manager.workers {
 			s := *worker.status
 			s.Uptime = time.Since(worker.status.StartTime).Round(time.Second).String()
 			stats = append(stats, s)
 		}
 
-		// Sắp xếp theo thứ tự trong config
+		// Sắp xếp
 		for i := 0; i < len(stats)-1; i++ {
 			for j := i + 1; j < len(stats); j++ {
 				if stats[i].Order > stats[j].Order {
@@ -479,6 +531,96 @@ func startMonitorServer() {
 		json.NewEncoder(w).Encode(stats)
 	})
 
-	log.Printf("Monitor server starting on http://localhost%s", MonitorPort)
+	log.Printf("Monitor Interface: http://localhost%s", MonitorPort)
 	log.Fatal(http.ListenAndServe(MonitorPort, nil))
 }
+
+// HTML Dashboard (Nhẹ & Hiện đại)
+const htmlContent = `<!DOCTYPE html>
+<html>
+<head>
+	<title>NTRIP Relay Ultimate</title>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<style>
+		body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; margin: 0; padding: 20px; background: #f0f2f5; color: #333; }
+		.container { max-width: 1200px; margin: 0 auto; }
+		h1 { color: #1a73e8; margin-bottom: 20px; border-bottom: 2px solid #e1e4e8; padding-bottom: 10px; }
+		.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(350px, 1fr)); gap: 15px; }
+		.card { background: white; border-radius: 8px; padding: 15px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); border-left: 5px solid #ddd; transition: transform 0.2s; }
+		.card:hover { transform: translateY(-2px); box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
+		
+		.header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
+		.id { font-weight: bold; font-size: 1.1em; color: #2c3e50; }
+		.badge { padding: 4px 10px; border-radius: 12px; font-size: 0.85em; font-weight: 600; color: white; }
+		
+		.Running { background-color: #34d399; border-left-color: #34d399; }
+		.Connecting { background-color: #f59e0b; border-left-color: #f59e0b; }
+		.Error { background-color: #ef4444; border-left-color: #ef4444; }
+		.Stopped { background-color: #9ca3af; border-left-color: #9ca3af; }
+		.Starting { background-color: #60a5fa; border-left-color: #60a5fa; }
+
+		.stat-row { display: flex; justify-content: space-between; margin: 5px 0; font-size: 0.9em; }
+		.label { color: #6b7280; }
+		.val { font-family: monospace; font-weight: 600; }
+		.msg { font-size: 0.8em; color: #ef4444; margin-top: 8px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+		
+		.footer { margin-top: 30px; text-align: center; font-size: 0.8em; color: #9ca3af; }
+	</style>
+</head>
+<body>
+	<div class="container">
+		<h1>🛰️ NTRIP Relay Monitor</h1>
+		<div id="grid" class="grid">Loading...</div>
+		<div class="footer">Auto-refreshing every 2s • System Ready</div>
+	</div>
+
+	<script>
+		function formatBytes(bytes) {
+			if (bytes === 0) return '0 B';
+			const k = 1024;
+			const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
+			const i = Math.floor(Math.log(bytes) / Math.log(k));
+			return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+		}
+
+		function update() {
+			fetch('/status')
+			.then(r => r.json())
+			.then(data => {
+				const grid = document.getElementById('grid');
+				if(!data || data.length === 0) {
+					grid.innerHTML = '<div style="grid-column: 1/-1; text-align: center; padding: 20px;">No stations configured</div>';
+					return;
+				}
+				
+				grid.innerHTML = data.map(s => {
+					const statusClass = s.status.split(' ')[0]; // Lấy từ đầu tiên
+					let html = '<div class="card ' + statusClass + '" style="border-left-color: var(--' + statusClass + ')">' +
+						'<div class="header">' +
+							'<span class="id">' + s.id + '</span>' +
+							'<span class="badge ' + statusClass + '">' + s.status + '</span>' +
+						'</div>' +
+						'<div class="stat-row">' +
+							'<span class="label">Uptime:</span>' +
+							'<span class="val">' + s.uptime + '</span>' +
+						'</div>' +
+						'<div class="stat-row">' +
+							'<span class="label">Data:</span>' +
+							'<span class="val">' + formatBytes(s.bytes_forwarded) + '</span>' +
+						'</div>';
+					if (s.last_message) {
+						html += '<div class="msg" title="' + s.last_message + '">⚠️ ' + s.last_message + '</div>';
+					}
+					html += '</div>';
+					return html;
+				}).join('');
+			})
+			.catch(e => console.error(e));
+		}
+		
+		update();
+		setInterval(update, 2000);
+	</script>
+</body>
+</html>`

@@ -436,11 +436,11 @@ Khi bạn sửa code trong `main.go` và build lại ra `relay.exe` mới, bạn
 
 1.  Mở CMD (Admin), gõ lệnh dừng:
     ```cmd
-    nssm stop NtripRelayService
+    ,.\nssm stop NtripRelayService
     ```
 2.  Copy file `relay.exe` mới đè lên file cũ trong `C:\NtripRelay`.
 3.  Gõ lệnh bật lại:
     ```cmd
-    nssm start NtripRelayService
+    .\nssm start NtripRelayService
     ```
 
