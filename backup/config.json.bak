@@ -1,0 +1,22 @@
+[
+  {
+    "id": "TDLC",
+    "enable": true,
+    "src_host": "18.220.121.113",
+    "src_port": 2333,
+    "src_mount": "TDLC",
+    "src_user": "guest1234",
+    "src_pass": "123456789",
+    "src_proxy": "",
+    "src_use_ssl": false,
+    "dst_host": "rtktk.online",
+    "dst_port": 1509,
+    "dst_mount": "TDLC234",
+    "dst_user": "EagerlyHandyFish",
+    "dst_pass": "Nguyen1509",
+    "dst_proxy": "",
+    "dst_use_ssl": false,
+    "lat": 43.422808,
+    "lon": 141.888362
+  }
+]
