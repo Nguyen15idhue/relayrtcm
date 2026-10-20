@@ -1,0 +1,29 @@
+# Local configuration and secrets
+/config.json
+/backup/config.json
+/backup/config.json.*
+!/backup/config.example.json
+
+# SQLite history
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# Logs
+/logs/
+/backup/logs/
+*.log
+
+# Build artifacts and binaries
+/relay.exe
+/backup/relay.exe
+/backup/relay.exe.*
+/backup/relay_new.exe
+*.exe
+
+# Local backups and working copies
+*.bak
+*.bak_*
+_backup_srcfix_*/

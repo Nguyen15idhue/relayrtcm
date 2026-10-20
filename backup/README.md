@@ -28,28 +28,13 @@ Lúc này cấu trúc thư mục `C:\NtripRelay` sẽ có:
 Tại thư mục `C:\NtripRelay`, bạn tạo 2 file sau:
 
 #### 1. File cấu hình: `config.json`
-Mở Notepad, dán nội dung dưới đây và lưu tên là `config.json` (chọn Save as type: All Files).
+Sao chép file mẫu `config.example.json` thành `config.json`, sau đó điền thông tin thật của trạm:
 
-```json
-[
-  {
-    "id": "tram_mau_1",
-    "enable": true,
-    "src_host": "rtktk.online",
-    "src_port": 1509,
-    "src_mount": "YBI_VanYen",
-    "src_user": "nguyen",
-    "src_pass": "12345678",
-    "dst_host": "servers.onocoy.com",
-    "dst_port": 2101,
-    "dst_mount": "YBVY_Relay",
-    "dst_user": "PlainlyFairFirefly",
-    "dst_pass": "Nguyen1509232",
-    "lat": 21.0,
-    "lon": 105.0
-  }
-]
+```powershell
+Copy-Item .\config.example.json .\config.json
 ```
+
+`config.json` chứa tài khoản thật nên đã được đưa vào `.gitignore`, không commit lên Git.
 
 #### 2. File mã nguồn: `main.go`
 Tạo file tên là `main.go`, dán toàn bộ code (phiên bản đã sửa lỗi ngắt kết nối và tối ưu) dưới đây:
@@ -382,9 +367,10 @@ func startMonitorServer() {
 2.  Gõ các lệnh sau để tạo file chạy:
     ```cmd
     cd C:\NtripRelay
-    go build -ldflags "-s -w" -o relay.exe main.go
+    go build -ldflags "-s -w" -o relay.exe .
     ```
-    *Lưu ý: Sau khi chạy xong, trong thư mục sẽ xuất hiện file `relay.exe`.*
+    *Lưu ý: Sau khi chạy xong, trong thư mục sẽ xuất hiện file `relay.exe`. Phải build cả package (dấu `.`) vì project có thêm `history.go`.*
+    *Khi chạy, relay tự tạo `history.db` (cùng thư mục) để lưu lịch sử kết nối/lỗi. Không xóa file này nếu muốn giữ lịch sử.*
 
 ---
 

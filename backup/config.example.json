@@ -1,0 +1,23 @@
+[
+  {
+    "id": "station_01",
+    "enable": true,
+    "src_host": "source.example.com",
+    "src_port": 2101,
+    "src_mount": "SOURCE_MOUNTPOINT",
+    "src_user": "YOUR_SOURCE_USER",
+    "src_pass": "YOUR_SOURCE_PASSWORD",
+    "src_proxy": "",
+    "src_use_ssl": false,
+    "dst_host": "caster.example.com",
+    "dst_port": 2101,
+    "dst_mount": "DESTINATION_MOUNTPOINT",
+    "dst_user": "YOUR_DEST_USER",
+    "dst_pass": "YOUR_DEST_PASSWORD",
+    "dst_proxy": "",
+    "dst_use_ssl": false,
+    "lat": 21.0,
+    "lon": 105.0,
+    "nmea_interval_sec": 5
+  }
+]
