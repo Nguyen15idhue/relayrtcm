@@ -27,3 +27,6 @@
 *.bak
 *.bak_*
 _backup_srcfix_*/
+
+# Local secret notes (WireGuard keys, proxy passwords)
+/backup/kehoach/*ireguard*.txt

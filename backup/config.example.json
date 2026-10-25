@@ -18,6 +18,7 @@
     "dst_use_ssl": false,
     "lat": 21.0,
     "lon": 105.0,
+    "user_agent_prefix": "NTRIP",
     "nmea_interval_sec": 5
   }
 ]

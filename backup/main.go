@@ -16,6 +16,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -124,6 +125,9 @@ type ConfigStation struct {
 	DstUseSSL bool    `json:"dst_use_ssl"` // Kết nối SSL/TLS tới destination
 	Lat       float64 `json:"lat"`
 	Lon       float64 `json:"lon"`
+	// UserAgentPrefix: tiền tố User-Agent gửi tới caster (VD: "NTRIP").
+	// Rỗng = giữ nguyên User-Agent mặc định của device profile.
+	UserAgentPrefix string `json:"user_agent_prefix,omitempty"`
 	// NMEAIntervalSec: 0 = auto theo device profile, >0 = chu kỳ gửi GGA/NMEA (giây)
 	NMEAIntervalSec int `json:"nmea_interval_sec,omitempty"`
 }
@@ -427,8 +431,8 @@ func reloadConfig() {
 			hdop := device.HDOPRange[0] + rng.Float64()*(device.HDOPRange[1]-device.HDOPRange[0])
 			sats := device.SatsRange[0] + rng.Intn(device.SatsRange[1]-device.SatsRange[0]+1)
 
-			// Generate random version dựa trên template
-			userAgent := generateUserAgent(device, rng)
+			// Generate random version dựa trên template, sau đó ghép tiền tố cấu hình
+			userAgent := buildUserAgent(cfg.UserAgentPrefix, generateUserAgent(device, rng))
 
 			w := &Worker{
 				cfg:        cfg,
@@ -691,8 +695,16 @@ func (w *Worker) runSession() error {
 
 	// [QUAN TRỌNG] Bufio bọc lấy srcConn. Cần giữ cái Reader này dùng mãi mãi.
 	srcReader := bufio.NewReaderSize(srcConn, BufferSize)
-	if err := checkResponse(srcReader, srcConn); err != nil {
+	chunkedSource, err := checkResponse(srcReader, srcConn)
+	if err != nil {
 		return fmt.Errorf("source auth: %w", err)
+	}
+	// Một số caster (VD: geortk.jp/BKG) trả Transfer-Encoding: chunked.
+	// Phải giải mã chunk trước khi chuyển tiếp, nếu không RTCM sẽ lẫn ký tự kích thước chunk.
+	var srcStream io.Reader = srcReader
+	if chunkedSource {
+		srcStream = newChunkedReader(srcReader)
+		log.Printf("[%s] Source uses chunked transfer encoding - decoding enabled", w.cfg.ID)
 	}
 
 	// Gửi NMEA mở hàng (ban đầu là Single vì chưa có data)
@@ -717,7 +729,7 @@ func (w *Worker) runSession() error {
 
 	// Check Dest trả lời
 	dstReader := bufio.NewReader(dstConn)
-	if err := checkResponse(dstReader, dstConn); err != nil {
+	if _, err := checkResponse(dstReader, dstConn); err != nil {
 		return fmt.Errorf("dest auth: %w", err)
 	}
 
@@ -813,7 +825,7 @@ func (w *Worker) runSession() error {
 		srcConn.SetReadDeadline(time.Now().Add(ReadTimeout))
 
 		// ĐỌC TỪ BUFFER READER (Không phải conn)
-		n, err := srcReader.Read(buf)
+		n, err := srcStream.Read(buf)
 		if err != nil {
 			return fmt.Errorf("read source: %v", err)
 		}
@@ -1025,7 +1037,8 @@ func connectToHost(ctx context.Context, host string, port int, proxyURL string, 
 
 // ================= HELPERS =================
 
-func checkResponse(reader *bufio.Reader, conn net.Conn) error {
+// checkResponse đọc status line + headers. Trả về true nếu response dùng chunked encoding.
+func checkResponse(reader *bufio.Reader, conn net.Conn) (bool, error) {
 	// Timeout cho việc đọc header response
 	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 	defer conn.SetReadDeadline(time.Time{})
@@ -1033,12 +1046,13 @@ func checkResponse(reader *bufio.Reader, conn net.Conn) error {
 	line, err := reader.ReadString('\n')
 	if err != nil {
 		if err == io.EOF {
-			return fmt.Errorf("server closed immediately (EOF) - Check credentials/mountpoint")
+			return false, fmt.Errorf("server closed immediately (EOF) - Check credentials/mountpoint")
 		}
-		return err
+		return false, err
 	}
 
 	// Đọc xả hết các dòng header còn lại (đến khi gặp dòng trắng)
+	chunked := false
 	for {
 		l, err := reader.ReadString('\n')
 		if err != nil {
@@ -1047,15 +1061,103 @@ func checkResponse(reader *bufio.Reader, conn net.Conn) error {
 		if l == "\r\n" || l == "\n" {
 			break
 		}
+		if strings.HasPrefix(strings.ToLower(l), "transfer-encoding:") &&
+			strings.Contains(strings.ToLower(l), "chunked") {
+			chunked = true
+		}
 	}
 
 	// Kiểm tra mã phản hồi
 	if strings.Contains(line, "200 OK") || strings.Contains(line, "ICY 200") {
-		return nil
+		return chunked, nil
 	}
 
 	// Server báo lỗi (401, 404, 403...)
-	return fmt.Errorf("rejected: %s", strings.TrimSpace(line))
+	return false, fmt.Errorf("rejected: %s", strings.TrimSpace(line))
+}
+
+// chunkedReader giải mã Transfer-Encoding: chunked từ NTRIP caster.
+type chunkedReader struct {
+	reader    *bufio.Reader
+	remaining int64
+	done      bool
+}
+
+func newChunkedReader(r *bufio.Reader) *chunkedReader {
+	return &chunkedReader{reader: r}
+}
+
+func (cr *chunkedReader) Read(p []byte) (int, error) {
+	if cr.done {
+		return 0, io.EOF
+	}
+	if len(p) == 0 {
+		return 0, nil
+	}
+
+	// Đọc header của chunk kế tiếp khi chunk hiện tại đã hết
+	for cr.remaining == 0 {
+		line, err := cr.reader.ReadString('\n')
+		if err != nil {
+			return 0, err
+		}
+		line = strings.TrimSpace(line)
+		if idx := strings.IndexByte(line, ';'); idx >= 0 {
+			line = strings.TrimSpace(line[:idx]) // bỏ chunk extension
+		}
+		if line == "" {
+			continue
+		}
+
+		size, err := strconv.ParseInt(line, 16, 64)
+		if err != nil || size < 0 {
+			return 0, fmt.Errorf("invalid chunk size %q", line)
+		}
+		if size == 0 {
+			if err := cr.discardTrailers(); err != nil {
+				return 0, err
+			}
+			cr.done = true
+			return 0, io.EOF
+		}
+		cr.remaining = size
+	}
+
+	if int64(len(p)) > cr.remaining {
+		p = p[:cr.remaining]
+	}
+	n, err := cr.reader.Read(p)
+	cr.remaining -= int64(n)
+
+	if cr.remaining == 0 {
+		if crlfErr := cr.discardCRLF(); err == nil {
+			err = crlfErr
+		}
+	}
+	return n, err
+}
+
+func (cr *chunkedReader) discardCRLF() error {
+	line, err := cr.reader.ReadString('\n')
+	if err != nil {
+		return err
+	}
+	if line != "\r\n" && line != "\n" {
+		return fmt.Errorf("invalid chunk terminator %q", line)
+	}
+	return nil
+}
+
+func (cr *chunkedReader) discardTrailers() error {
+	for {
+		line, err := cr.reader.ReadString('\n')
+		if err != nil {
+			return err
+		}
+		if line == "\r\n" || line == "\n" {
+			return nil
+		}
+	}
 }
 
 func basicAuth(user, pass string) string {
@@ -1063,6 +1165,19 @@ func basicAuth(user, pass string) string {
 }
 
 // ================= USER-AGENT GENERATOR =================
+// buildUserAgent ghép tiền tố cấu hình với User-Agent mặc định.
+// Ví dụ: prefix "NTRIP" + base "GNSSInternetRadio/1.2.3" -> "NTRIP GNSSInternetRadio/1.2.3".
+func buildUserAgent(prefix, base string) string {
+	prefix = strings.TrimSpace(prefix)
+	if prefix == "" {
+		return base
+	}
+	if !strings.HasSuffix(prefix, " ") {
+		prefix += " "
+	}
+	return prefix + base
+}
+
 func generateUserAgent(device DeviceProfile, rng *rand.Rand) string {
 	version := ""
 
@@ -1623,6 +1738,7 @@ func handleConfigs(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		newStation.UserAgentPrefix = strings.TrimSpace(newStation.UserAgentPrefix)
 		newStation.NMEAIntervalSec = normalizeNMEAIntervalSec(newStation.NMEAIntervalSec)
 
 		// Đọc config hiện tại
@@ -1696,6 +1812,7 @@ func handleConfigItem(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		updated.UserAgentPrefix = strings.TrimSpace(updated.UserAgentPrefix)
 		updated.NMEAIntervalSec = normalizeNMEAIntervalSec(updated.NMEAIntervalSec)
 
 		found := false
@@ -2111,6 +2228,7 @@ const htmlContent = `<!DOCTYPE html>
   "dst_use_ssl": false,
   "lat": 10.0,
   "lon": 106.0,
+  "user_agent_prefix": "NTRIP",
   "nmea_interval_sec": 10
 }
 
@@ -2227,6 +2345,10 @@ Example:
 					<div class="form-group">
 						<label>Longitude</label>
 						<input type="number" step="0.000001" id="f-lon" value="0">
+					</div>
+					<div class="form-group">
+						<label>User-Agent Prefix (blank = device default)</label>
+						<input type="text" id="f-ua-prefix" placeholder="NTRIP">
 					</div>
 					<div class="form-group">
 						<label>GGA/NMEA Interval (seconds, 0 = auto)</label>
@@ -2477,6 +2599,7 @@ Example:
 				'<th style="padding: 12px;">ID</th>' +
 				'<th style="padding: 12px;">Source</th>' +
 				'<th style="padding: 12px;">Destination</th>' +
+				'<th style="padding: 12px;">UA Prefix</th>' +
 				'<th style="padding: 12px;">GGA</th>' +
 				'<th style="padding: 12px;">Status</th>' +
 				'<th style="padding: 12px;">Actions</th>' +
@@ -2487,6 +2610,7 @@ Example:
 					'<td style="padding: 12px; font-weight: 600;">' + s.id + '</td>' +
 					'<td style="padding: 12px;">' + s.src_host + ':' + s.src_port + '/' + s.src_mount + (s.src_use_ssl ? ' 🔒' : '') + (s.src_proxy ? ' 🌐' : '') + '</td>' +
 					'<td style="padding: 12px;">' + s.dst_host + ':' + s.dst_port + '/' + s.dst_mount + (s.dst_use_ssl ? ' 🔒' : '') + (s.dst_proxy ? ' 🌐' : '') + '</td>' +
+					'<td style="padding: 12px;">' + (s.user_agent_prefix || '-') + '</td>' +
 					'<td style="padding: 12px;">' + (s.nmea_interval_sec ? s.nmea_interval_sec + 's' : 'auto') + '</td>' +
 					'<td style="padding: 12px;">' + (s.enable ? '<span class="badge badge-running">Enabled</span>' : '<span class="badge badge-stopped">Disabled</span>') + '</td>' +
 					'<td style="padding: 12px;"><div style="display: flex; gap: 5px;">' +
@@ -2567,6 +2691,7 @@ Example:
 				document.getElementById('f-dst-ssl').checked = s.dst_use_ssl || false;
 				document.getElementById('f-lat').value = s.lat || 0;
 				document.getElementById('f-lon').value = s.lon || 0;
+				document.getElementById('f-ua-prefix').value = s.user_agent_prefix || '';
 				document.getElementById('f-nmea-interval').value = s.nmea_interval_sec || 0;
 				document.getElementById('f-enable').checked = s.enable;
 				
@@ -2651,6 +2776,8 @@ Example:
 					if (!('dst_use_ssl' in station)) station.dst_use_ssl = false;
 					if (!('lat' in station)) station.lat = 0;
 					if (!('lon' in station)) station.lon = 0;
+					if (!('user_agent_prefix' in station)) station.user_agent_prefix = '';
+					station.user_agent_prefix = String(station.user_agent_prefix).trim();
 					if (!('nmea_interval_sec' in station)) station.nmea_interval_sec = 0;
 					station.nmea_interval_sec = Math.max(0, Math.min(3600, parseInt(station.nmea_interval_sec) || 0));
 				});
@@ -2744,6 +2871,7 @@ Example:
 				dst_use_ssl: document.getElementById('f-dst-ssl').checked,
 				lat: parseFloat(document.getElementById('f-lat').value) || 0,
 				lon: parseFloat(document.getElementById('f-lon').value) || 0,
+				user_agent_prefix: document.getElementById('f-ua-prefix').value.trim(),
 				nmea_interval_sec: Math.max(0, Math.min(3600, parseInt(document.getElementById('f-nmea-interval').value) || 0))
 			};
 			
